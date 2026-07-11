@@ -1,0 +1,187 @@
+from aiogram import Router, F
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.types import Message, CallbackQuery
+
+import database as db
+import keyboards as kb
+from states import SearchBook, MakeOrder, RateBook
+from config import PAGE_SIZE, ADMIN_IDS
+
+router = Router()
+
+
+# ---------- START ----------
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    await db.upsert_user(message.from_user.id, message.from_user.username, message.from_user.full_name)
+    await message.answer(
+        "📚 <b>Kutubxonabot</b>ga xush kelibsiz!\n\n"
+        "Bu yerda istalgan janrdagi audio va matnli kitoblarni topishingiz, "
+        "o'zingiz xohlagan kitobni buyurtma qilishingiz va o'qigan kitobingizni "
+        "baholashingiz mumkin.",
+        reply_markup=kb.main_menu(message.from_user.id),
+    )
+
+
+@router.message(F.text == "⬅️ Asosiy menyu")
+async def back_to_main(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Asosiy menyu:", reply_markup=kb.main_menu(message.from_user.id))
+
+
+@router.message(F.text == "ℹ️ Bot haqida")
+async def about(message: Message):
+    await message.answer(
+        "📖 <b>Kutubxonabot</b> — kitob olamiga oid hamma narsa bitta botda:\n"
+        "audio va matnli kitoblar, janrlar bo'yicha qidiruv, shaxsiy buyurtma, "
+        "baholash va pullik buyurtmalar xizmati.\n\n"
+        "Bot doimiy yangilanib boradi 🔄"
+    )
+
+
+@router.message(F.text == "❌ Bekor qilish")
+async def cancel_any(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Bekor qilindi.", reply_markup=kb.main_menu(message.from_user.id))
+
+
+# ---------- SEARCH ----------
+
+@router.message(F.text == "🔍 Qidirish")
+async def search_start(message: Message, state: FSMContext):
+    await state.set_state(SearchBook.query)
+    await message.answer("Kitob nomi yoki muallifini yozing:", reply_markup=kb.cancel_kb())
+
+
+@router.message(SearchBook.query)
+async def search_process(message: Message, state: FSMContext):
+    await state.clear()
+    results = await db.search_books(message.text.strip())
+    if not results:
+        await message.answer("😕 Hech narsa topilmadi.", reply_markup=kb.main_menu(message.from_user.id))
+        return
+    await message.answer(f"🔎 {len(results)} ta natija topildi:", reply_markup=kb.main_menu(message.from_user.id))
+    for book in results[:10]:
+        await send_book_card(message, book)
+
+
+async def send_book_card(message: Message, book):
+    avg, count = await db.get_book_rating(book["id"])
+    price_text = "🆓 Bepul" if not book["price"] else f"💰 {book['price']:,} so'm".replace(",", " ")
+    type_text = "🎧 Audio" if book["book_type"] == "audio" else "📖 Matnli"
+    author_text = book["author"] or "Muallif noma'lum"
+    caption = (
+        f"<b>{book['title']}</b>\n"
+        f"✍️ {author_text}\n"
+        f"🏷 {book['genre'] or '-'}  |  {type_text}\n"
+        f"⭐ {avg}/5 ({count} baho)\n"
+        f"{price_text}\n\n"
+        f"{(book['description'] or '')[:300]}"
+    )
+    if book["cover_file_id"]:
+        await message.answer_photo(book["cover_file_id"], caption=caption, reply_markup=kb.book_card_kb(book["id"]))
+    else:
+        await message.answer(caption, reply_markup=kb.book_card_kb(book["id"]))
+
+
+# ---------- GENRES ----------
+
+@router.message(F.text == "📚 Janrlar")
+async def genres_list(message: Message):
+    genres = await db.get_genres()
+    if not genres:
+        await message.answer("Hozircha janrlar mavjud emas.")
+        return
+    await message.answer("Janrni tanlang:", reply_markup=kb.genres_inline(genres))
+
+
+@router.callback_query(F.data.startswith("genre:"))
+async def genre_books(callback: CallbackQuery):
+    _, genre, offset = callback.data.split(":")
+    offset = int(offset)
+    books = await db.get_books_by_genre(genre, offset, PAGE_SIZE)
+    if not books:
+        await callback.answer("Bu janrda kitob topilmadi.", show_alert=True)
+        return
+    await callback.answer()
+    for book in books:
+        await send_book_card(callback.message, book)
+    has_more = len(books) == PAGE_SIZE
+    nav_kb = kb.pagination_kb("genre", genre, offset, PAGE_SIZE, has_more)
+    if nav_kb.inline_keyboard:
+        await callback.message.answer("Ko'proq ko'rish:", reply_markup=nav_kb)
+
+
+# ---------- AUDIO / TEXT ----------
+
+@router.message(F.text.in_({"🎧 Audio kitoblar", "📖 Matnli kitoblar"}))
+async def browse_by_type(message: Message):
+    book_type = "audio" if "Audio" in message.text else "text"
+    books = await db.get_books_by_type(book_type, 0, PAGE_SIZE)
+    if not books:
+        await message.answer("Hozircha bu turdagi kitoblar mavjud emas.")
+        return
+    for book in books:
+        await send_book_card(message, book)
+    has_more = len(books) == PAGE_SIZE
+    nav_kb = kb.pagination_kb("type", book_type, 0, PAGE_SIZE, has_more)
+    if nav_kb.inline_keyboard:
+        await message.answer("Ko'proq ko'rish:", reply_markup=nav_kb)
+
+
+@router.callback_query(F.data.startswith("type:"))
+async def type_books_page(callback: CallbackQuery):
+    _, book_type, offset = callback.data.split(":")
+    offset = int(offset)
+    books = await db.get_books_by_type(book_type, offset, PAGE_SIZE)
+    if not books:
+        await callback.answer("Boshqa kitob yo'q.", show_alert=True)
+        return
+    await callback.answer()
+    for book in books:
+        await send_book_card(callback.message, book)
+    has_more = len(books) == PAGE_SIZE
+    nav_kb = kb.pagination_kb("type", book_type, offset, PAGE_SIZE, has_more)
+    if nav_kb.inline_keyboard:
+        await callback.message.answer("Ko'proq ko'rish:", reply_markup=nav_kb)
+
+
+# ---------- BOOK INFO / SEND FILE ----------
+
+@router.callback_query(F.data.startswith("info:"))
+async def book_info(callback: CallbackQuery):
+    book_id = int(callback.data.split(":")[1])
+    book = await db.get_book(book_id)
+    if not book:
+        await callback.answer("Kitob topilmadi.", show_alert=True)
+        return
+    await callback.answer()
+    if book["price"]:
+        await callback.message.answer(
+            f"💰 Bu kitob pullik ({book['price']:,} so'm). ".replace(",", " ") +
+            "Buyurtma qilish uchun \"🛒 Kitob buyurtma qilish\" bo'limidan foydalaning."
+        )
+        return
+    if book["book_type"] == "audio":
+        await callback.message.answer_audio(book["file_id"], caption=book["title"])
+    else:
+        await callback.message.answer_document(book["file_id"], caption=book["title"])
+
+
+# ---------- ORDER ----------
+
+@router.message(F.text == "🛒 Kitob buyurtma qilish")
+async def order_start(message: Message, state: FSMContext):
+    await state.set_state(MakeOrder.title)
+    await message.answer(
+        "Qaysi kitobni topib berishimni xohlaysiz? Kitob nomi (va muallifini) yozing:",
+        reply_markup=kb.cancel_kb(),
+    )
+
+
+@router.message(MakeOrder.title)
+async def order_title(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await state.set_
